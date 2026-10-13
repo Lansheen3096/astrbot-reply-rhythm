@@ -14,7 +14,7 @@
 ## 安装
 
 ```bash
-git clone https://github.com/<你的账号>/astrbot-reply-rhythm
+git clone https://github.com/Lansheen3096/astrbot-reply-rhythm
 cp -r astrbot-reply-rhythm/astrbot_plugin_* <AstrBot>/data/plugins/
 # docker 部署：拷进宿主机挂载的数据目录后重启容器
 docker compose restart astrbot
