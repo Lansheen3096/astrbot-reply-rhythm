@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pre-*
+.DS_Store
+SANITIZE-DIFF.txt
+PUBLISH-TODO.md

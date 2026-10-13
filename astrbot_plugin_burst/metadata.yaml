@@ -1,0 +1,4 @@
+name: astrbot_plugin_burst
+desc: 消息防抖聚合：静默 20 秒或单条 ≥25 字才放行，把一批消息合成一条再交给流水线
+author: Lansheen3096
+version: 0.1.0

@@ -1,0 +1,4 @@
+name: astrbot_plugin_proactive
+desc: 条件式主动消息 —— 用户安静够久，bot 自己发一条过来（内容由 LLM 按当前会话人设现写）
+author: Lansheen3096
+version: 0.1.0
