@@ -1,6 +1,6 @@
 """条件式主动消息：用户多久没说话，bot 自己发一条过来。
 
-人设里通常写着「等得够久了，我会自己发一条过去」，但框架里没有这条链路，
+人设里可能写了关于主动发消息的提示词，但框架里没有这条链路，
 于是模型在对话里只能"编"自己发过。这个插件把这句话落实，顺便少一个幻觉来源。
 
 规则（都可调）：
@@ -31,9 +31,9 @@ from astrbot.core.message.message_event_result import MessageChain
 DATA = "/AstrBot/data"
 STATE_PATH = os.path.join(DATA, "proactive_state.json")
 
-IDLE_HOURS = 5.0          # 用户安静这么久才考虑发
+IDLE_HOURS = 2.0          # 用户安静这么久才考虑发
 COOLDOWN_HOURS = 3.0      # 两条之间至少隔这么久
-DAILY_MAX = 2             # 每天上限
+DAILY_MAX = 5             # 每天上限
 ACTIVE_FROM, ACTIVE_TO = 8, 23   # 允许主动的时段（24 小时制，含起不含止）
 CHECK_EVERY = 300         # 每 5 分钟看一次
 SEG_GAP = (6.0, 12.0)     # 分条发送间隔
@@ -154,8 +154,8 @@ class Main(star.Star):
         st = self.state.get(umo) or {}
         idle = (time.time() - float(st.get("last_user") or time.time())) / 3600
         prompt = (
-            "（现在是 %s，距离用户上次说话已经 %s。"
-            "按人设主动发一条过去——接着上次的话题，或者只是打个招呼。"
+            "（现在是 %s，距离上次对话已经 %s。"
+            "按当前人设主动发一条过去——接着上次的话题，或者只是打个招呼。"
             "一句话一件事，别写成整段；不要解释为什么突然发消息；"
             "不要提提醒、定时、系统、插件这些字眼。）"
             % (time.strftime("%m月%d日 %H:%M"), ("%.1f 小时" % idle) if idle > 0 else "一会儿")

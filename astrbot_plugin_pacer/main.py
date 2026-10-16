@@ -9,7 +9,7 @@
     并把这个代号盖在当时那条事件上
   · `on_decorating_result` —— 截下 LLM 回复，按与核心完全相同的分段规则自己发送；
     **每次发送前比对代号**，变了就说明用户插话了 ⇒ 剩下的分段全部丢弃
-  · 丢弃后把历史里那条 assistant 消息改写成"实际发出去的部分"，免得她
+  · 丢弃后把历史里那条 assistant 消息改写成"实际发出去的部分"，免得 bot
     "记得"自己说过没发出去的话（否则下一轮会引用用户根本没看到的内容）
 
 安全阀：出异常且**一段都没发出去**时，把消息链还原，交回核心按原样发送
@@ -34,8 +34,11 @@ from astrbot.core.message.components import At, Plain, Reply
 DEFAULT_REGEX = r"[^\n]+"   # 兜底：按行切（切分只认换行）
 ONLY_PUNCT_RE = re.compile(r"[。？！~…，、；：,.?!~\-—\s]+")   # 整段只有标点
 PUNCT_TAIL_RE = re.compile(r"[。？！~…]+\s*$")                  # 段末/括号内的句末标点
-BRACKETS = (("（", "）"), ("(", ")"))
-MARK = "（话没说完）"     # 写进历史的标记：让她知道自己刚被打断
+# 切分符号（2026-10-14 定）：标点跟着前一句走；换行也算一条边界
+SPLIT_SYMBOLS = ("。", "？", "！", "——", "……", "♡", "?", "!", "…", "~", "～", "\n")
+# 括号表：括号块整体独立成一条，且按配对深度找闭合
+BRACKETS = (("（", "）"), ("(", ")"), ("【", "】"), ("「", "」"), ("《", "》"), ("〔", "〕"))
+MARK = "（话没说完）"     # 写进历史的标记：让 bot 知道自己刚被打断
 CFG_TTL = 30
 TRACE_FLAG = "/AstrBot/data/trace-stop.on"   # 诊断开关（存在=开）
 
@@ -56,6 +59,9 @@ class Main(star.Star):
         # (umo, gen) -> (收到消息的时刻, 星期)。给历史里的 user 消息打真时间用
         self.round_ts: dict[tuple[str, int], tuple[str, str]] = {}
         self._tasks: set[asyncio.Task] = set()   # 后台发送任务（防止被 GC）
+        # umo -> {"gen": g, "sent": n, "active": bool}
+        # 「这一轮还在处理吗 / 已经发出去几段」—— astrbot_plugin_burst 拿它决定新来的消息是【排队】还是【当插话打断】
+        self.round: dict[str, dict] = {}
         self._cfg: dict | None = None
         self._cfg_ts = 0.0
 
@@ -78,7 +84,7 @@ class Main(star.Star):
                 }
                 self._cfg_ts = now
             except Exception as exc:
-                logger.error("[flush] 读配置失败，用默认值: %s", exc)
+                logger.error("[pacer] 读配置失败，用默认值: %s", exc)
                 self._cfg = {
                     "interval": (8.0, 15.0),
                     "method": "random",
@@ -106,7 +112,7 @@ class Main(star.Star):
     def _clean(seg: str, cleanup: str) -> str:
         """按配置的 content_cleanup_rule 清掉括号动作。
 
-        ★ 括号【里面】若是句末标点结尾（"（笑。）"），把那个标点留在原地 ——
+        ★ 括号【里面】若是句末标点结尾（"（轻轻蹭你。）"），把那个标点留在原地 ——
           否则删掉动作，这句话的句号就跟着一起没了。不无中生有，只留住模型写过的。
         """
 
@@ -126,46 +132,106 @@ class Main(star.Star):
             return seg
 
     def _split(self, text: str, cfg: dict) -> list[str]:
-        """按【换行】切句子 —— 换行是唯一的切分依据。
+        """切分：句末标点 / 换行断句，括号整体独立成条。
 
-        人设要求她"每句话单独占一行，两句话中间空一行"，所以模型的行边界就是
-        消息边界。标点不再参与切分：从前按句末标点切，既会把一句话切碎，
-        又会在她不写标点的时候整个失效。
+        规则（2026-10-14 定，取代原来"只认换行"的写法）：
+          · 切分符号：。 ？ ！ —— …… ♡ 以及换行
+          · 标点跟着前一句走 —— 不会出现"只有标点"的消息
+          · 括号块（含括号里的内容）是一个原子：既不与相邻句子粘连，也不会被切开
         """
         src = text
         if cfg.get("cleanup"):
             # ★ 括号清洗在切分【之前】对全文做一次：动作可能跨行，
             #   先切再清的话，半个括号会被当成一条消息发出去。
             src = self._clean(src, cfg["cleanup"])
-        try:
-            parts = re.findall(cfg["regex"], src, re.DOTALL | re.MULTILINE)
-        except re.error:
-            logger.error("[flush] 分段正则无效，用默认式")
-            parts = re.findall(DEFAULT_REGEX, src, re.DOTALL | re.MULTILINE)
-        if not parts:
-            parts = [src]
         out: list[str] = []
-        pending = ""   # 攒着"还没找到归属"的标点
-        for seg in parts:
+        buf = ""
+        for kind, seg in self._atoms(src):
+            if kind == "bracket":
+                if buf.strip():
+                    out.append(buf)
+                    buf = ""
+                if seg.strip():
+                    out.append(seg)
+                continue
+            buf += seg
+            while True:
+                cut = self._cut_end(buf)
+                if cut is None:
+                    break
+                piece, buf = buf[:cut], buf[cut:]
+                if piece.strip():
+                    out.append(piece)
+        if buf.strip():
+            out.append(buf)
+
+        final: list[str] = []
+        for seg in out:
             seg = seg.strip()
             if not seg:
                 continue
-            # ★ 纯标点段：切分正则会把它切出来（"他说（笑）。我懂了。" 里的 "。"），
-            #   留着就会让她发一条只有一个句号的消息。并回前一段末尾。
-            if ONLY_PUNCT_RE.fullmatch(seg):
-                if out:
-                    out[-1] += seg
-                else:
-                    pending += seg
-                continue
-            out.append(pending + seg)
-            pending = ""
-        if pending:
-            if out:
-                out[-1] += pending
+            if ONLY_PUNCT_RE.fullmatch(seg) and final:
+                final[-1] += seg          # 纯标点并回上一条（历史行为）
             else:
-                out.append(pending)   # 整条都是标点，照原样发，别静默吞掉
-        return out
+                final.append(seg)
+        return final
+
+    @staticmethod
+    def _atoms(src: str) -> list:
+        """拆原子：括号块 / 普通片段。括号按配对深度找闭合；没闭合就把余下当普通文本。"""
+        atoms: list = []
+        i, n = 0, len(src)
+        while i < n:
+            lb = rb = ""
+            for a, b in BRACKETS:
+                if src.startswith(a, i):
+                    lb, rb = a, b
+                    break
+            if lb:
+                depth, j = 0, i
+                while j < n:
+                    if src.startswith(lb, j):
+                        depth += 1
+                        j += len(lb)
+                        continue
+                    if src.startswith(rb, j):
+                        depth -= 1
+                        j += len(rb)
+                        if depth == 0:
+                            break
+                        continue
+                    j += 1
+                if depth == 0:
+                    atoms.append(("bracket", src[i:j]))
+                    i = j
+                    continue
+                atoms.append(("text", src[i:]))      # 没闭合
+                break
+            j = i + 1
+            while j < n and not any(src.startswith(a, j) for a, _ in BRACKETS):
+                j += 1
+            atoms.append(("text", src[i:j]))
+            i = j
+        return atoms
+
+    @staticmethod
+    def _cut_end(s: str):
+        """该在这一刀之后的第一个位置（句末标点之后）；后面没有实义内容就不切。"""
+        i, n = 0, len(s)
+        while i < n:
+            sym = next((x for x in SPLIT_SYMBOLS if s.startswith(x, i)), None)
+            if not sym:
+                i += 1
+                continue
+            j = i + len(sym)
+            while j < n:        # 连着的标点（。！ ！！ ……。）一起收进前一条
+                sym2 = next((x for x in SPLIT_SYMBOLS if s.startswith(x, j)), None)
+                if not sym2:
+                    break
+                j += len(sym2)
+            return j if any(not c.isspace() for c in s[j:]) else None
+        return None
+
 
     # ---------------- 代号：每条入站消息 +1 ----------------
     @staticmethod
@@ -207,6 +273,7 @@ class Main(star.Star):
             self.seen[umo] = mid
         g = self.gen.get(umo, 0) + 1
         self.gen[umo] = g
+        self._round_begin(umo, g)          # 这一轮开始「在飞」：从进流水线到回复发完为止
         event.set_extra("pacer_gen", g)
         self.round_ts[(umo, g)] = (
             time.strftime("%Y-%m-%d %H:%M"),
@@ -215,7 +282,7 @@ class Main(star.Star):
         if len(self.round_ts) > 300:  # 别让这张表无限长
             for k in sorted(self.round_ts)[:150]:
                 self.round_ts.pop(k, None)
-        logger.info("[flush] 新一代 gen=%d（%s）", g, (event.message_str or "")[:20])
+        logger.info("[pacer] 新一代 gen=%d（%s）", g, (event.message_str or "")[:20])
 
     @filter.event_message_type(EventMessageType.PRIVATE_MESSAGE)
     async def bump_private(self, event: AstrMessageEvent) -> None:
@@ -224,6 +291,41 @@ class Main(star.Star):
     @filter.event_message_type(EventMessageType.GROUP_MESSAGE)
     async def bump_group(self, event: AstrMessageEvent) -> None:
         await self._bump(event)
+
+    # ---------------- 在飞状态（给 astrbot_plugin_burst 排队用） ----------------
+
+    def in_flight(self, umo: str) -> tuple[bool, int]:
+        """(这一轮还在处理吗, 已经发出去几段)。
+
+        burst 拿它决定新来的消息是【排队等这一轮发完】还是【当插话打断】。
+        """
+        st = self.round.get(umo)
+        if not st or not st.get("active"):
+            return (False, 0)
+        return (True, int(st.get("sent", 0)))
+
+    def _round_begin(self, umo: str, gen: int) -> None:
+        self.round[umo] = {"gen": gen, "sent": 0, "active": True}
+
+    def _mark_sent(self, umo: str, gen, n: int) -> None:
+        """记下发出去几段 —— 第一段一出去，burst 那边就不再排队、改成正常打断语义。"""
+        st = self.round.get(umo)
+        if st and st.get("gen") == gen:
+            st["sent"] = int(n)
+
+    def _round_end(self, umo: str, gen) -> None:
+        """一轮收尾（发完 / 被打断 / 没东西可发）⇒ 解除在飞，并让 burst 放行排队的那批。"""
+        st = self.round.get(umo)
+        if not st or st.get("gen") != gen:
+            return                 # 已经被新一轮顶掉了，别去动新的状态
+        st["active"] = False
+        try:
+            md = self.context.get_registered_star("astrbot_plugin_burst")
+            target = getattr(md, "star_cls", None) if md else None
+            if target is not None:
+                target.release_pending(umo, "上一轮已发完")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[pacer] 通知 burst 放行失败：%s", exc)
 
     # ---------------- 历史修正（含"框架没存就我们补"） ----------------
     @staticmethod
@@ -299,9 +401,9 @@ class Main(star.Star):
         """保证这一轮真的进了历史。
 
         两个目的：
-          ① 打断时把她的记录截成"实际发出去的"，别让她以为自己说完了；
+          ① 打断时把 bot 的记录截成"实际发出去的"，别让 bot 以为自己说完了；
           ② 框架那条保存路径不一定成功（实测 completion_text 为空时会直接 return），
-             那就我们自己补上——否则她整晚都在拿旧上下文回话。
+             那就自己补上 —— 否则 bot 整晚都在拿旧上下文回话。
 
         安全底线：**只动能对上号的条目**，绝不按位置盲改（曾经把几条旧的 assistant
         记录覆盖掉过），宁可不动也不能改错。
@@ -319,7 +421,7 @@ class Main(star.Star):
             if isinstance(h, str):
                 h = json.loads(h or "[]")
             if not isinstance(h, list):
-                logger.error("[flush] 历史格式看不懂: %r", type(h))
+                logger.error("[pacer] 历史格式看不懂: %r", type(h))
                 return
 
             sent_text = "".join(sent)
@@ -341,7 +443,7 @@ class Main(star.Star):
                 stamped = self._stamp_user(h, umo, gen, user_text)
                 await cm.update_conversation(umo, cid, history=h)
                 logger.info(
-                    "[flush] 历史截断：实发 %d/%d 段（user 打时间：%s）",
+                    "[pacer] 历史截断：实发 %d/%d 段（user 打时间：%s）",
                     len(sent),
                     total,
                     stamped,
@@ -358,7 +460,7 @@ class Main(star.Star):
                 if self._key(tail_user) != self._key(user_text):
                     del h[-1]
                     logger.info(
-                        "[flush] 丢掉尾巴上没人回的 user 消息（%d 字）", len(tail_user)
+                        "[pacer] 丢掉尾巴上没人回的 user 消息（%d 字）", len(tail_user)
                     )
             # 当前这条已经在了（框架存了用户那半）就别重复写
             last_user = ""
@@ -401,10 +503,10 @@ class Main(star.Star):
                     )
             await cm.update_conversation(umo, cid, history=h)
             logger.info(
-                "[flush] 框架没存这轮，已由我补写历史：实发 %d/%d 段", len(sent), total
+                "[pacer] 框架没存这轮，已由我补写历史：实发 %d/%d 段", len(sent), total
             )
         except Exception as exc:
-            logger.error("[flush] 写历史失败: %s\n%s", exc, traceback.format_exc())
+            logger.error("[pacer] 写历史失败: %s\n%s", exc, traceback.format_exc())
 
     # ---------------- 临时诊断：谁把事件 stop 了 ----------------
     @filter.on_astrbot_loaded()
@@ -497,8 +599,16 @@ class Main(star.Star):
     # ---------------- 接管发送 ----------------
     @filter.on_decorating_result()
     async def takeover(self, event: AstrMessageEvent) -> None:
+        # umo / 代号要最先取：下面每条提前 return 的路径都得把「在飞」状态收掉，
+        # 否则 burst 那边会一直以为这一轮还没结束（排队卡到超时）。
+        umo = event.unified_msg_origin
+        my_gen = event.get_extra("pacer_gen")
+        if my_gen is None:
+            my_gen = self.gen.get(umo, 0)
+
         result = event.get_result()
         if result is None or not result.chain:
+            self._round_end(umo, my_gen)
             return
         if os.path.exists(TRACE_FLAG):
             try:
@@ -509,15 +619,13 @@ class Main(star.Star):
             except Exception:
                 pass
         if not result.is_llm_result():
+            self._round_end(umo, my_gen)
             return  # 只管 LLM 的回复，指令回复走核心原路
         if (event.message_str or "").strip().startswith("/"):
+            self._round_end(umo, my_gen)
             return
 
-        umo = event.unified_msg_origin
         cfg = self._seg()
-        my_gen = event.get_extra("pacer_gen")
-        if my_gen is None:
-            my_gen = self.gen.get(umo, 0)
 
         headers = [c for c in result.chain if isinstance(c, (Reply, At))]
         segs: list[list] = []
@@ -530,12 +638,14 @@ class Main(star.Star):
             else:
                 segs.append([comp])  # 非文本段（图片/语音等）自己一段，不分
         if not segs:
+            self._round_end(umo, my_gen)
             return
 
         snapshot = list(result.chain)
         try:
             result.chain.clear()  # 核心别再发了，下面我们自己发
         except Exception:
+            self._round_end(umo, my_gen)
             return
 
         # ★ 关键：发送放到后台任务里，**不要阻塞流水线**。
@@ -565,29 +675,36 @@ class Main(star.Star):
     ) -> None:
         sent: list[str] = []
         try:
-            for seg in segs:
-                text = seg[0].text if isinstance(seg[0], Plain) else ""
-                await asyncio.sleep(self._interval(cfg, text))
-                if self.gen.get(umo, 0) != my_gen:
-                    logger.info(
-                        "[flush] 被打断 —— 已发 %d/%d 段，剩下的丢弃", len(sent), len(segs)
-                    )
-                    break
-                await event.send(result.derive([*head, *seg]))
-                if head:
-                    head.clear()
-                if text:
-                    sent.append(text)
-        except Exception as exc:
-            logger.error("[flush] 发送出错: %s\n%s", exc, traceback.format_exc())
-            if not sent and full_text:
-                # 一段都没发出去 → 退化成整条发出，别静默吞消息
-                try:
-                    await event.send(result.derive([Plain(full_text)]))
-                    sent.append(full_text)
-                except Exception as exc2:
-                    logger.error("[flush] 兜底整条发送也失败: %s", exc2)
-        # 不管有没有被全部发完，都走一遍：框架那条保存路径不一定成功
-        await self._ensure_history(
-            event, user_text, full_text, sent, len(segs), my_gen
-        )
+            try:
+                for seg in segs:
+                    text = seg[0].text if isinstance(seg[0], Plain) else ""
+                    await asyncio.sleep(self._interval(cfg, text))
+                    if self.gen.get(umo, 0) != my_gen:
+                        logger.info(
+                            "[pacer] 被打断 —— 已发 %d/%d 段，剩下的丢弃", len(sent), len(segs)
+                        )
+                        break
+                    await event.send(result.derive([*head, *seg]))
+                    if head:
+                        head.clear()
+                    if text:
+                        sent.append(text)
+                    # 第一段一出去就记账 ⇒ burst 那边从此不再排队，改回「插话就打断」
+                    self._mark_sent(umo, my_gen, len(sent))
+            except Exception as exc:
+                logger.error("[pacer] 发送出错: %s\n%s", exc, traceback.format_exc())
+                if not sent and full_text:
+                    # 一段都没发出去 → 退化成整条发出，别静默吞消息
+                    try:
+                        await event.send(result.derive([Plain(full_text)]))
+                        sent.append(full_text)
+                        self._mark_sent(umo, my_gen, len(sent))
+                    except Exception as exc2:
+                        logger.error("[pacer] 兜底整条发送也失败: %s", exc2)
+            # 不管有没有被全部发完，都走一遍：框架那条保存路径不一定成功
+            await self._ensure_history(
+                event, user_text, full_text, sent, len(segs), my_gen
+            )
+        finally:
+            # ★ 一轮到此收尾：解除「在飞」，并让 burst 把排队的那批立刻放出来
+            self._round_end(umo, my_gen)

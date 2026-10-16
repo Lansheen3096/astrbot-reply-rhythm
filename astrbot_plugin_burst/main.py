@@ -1,7 +1,6 @@
-"""burst —— 消息防抖聚合：静默 20 秒 / 单条 ≥25 字才放行。
+"""astrbot_plugin_burst —— 消息防抖聚合：静默 20 秒 / 单条 ≥25 字才放行。
 
-把「收到一条回一条」改成「静默一小会儿，把这批消息合成一条再回」：
-用户连发三条时模型只会被触发一次，而它看到的是完整的上下文。
+设计稿：~/Documents/qqbotdev_advanced/触发结构改造-消息聚合与输入状态.md
 
 为什么挂在适配器层：包住 Platform.commit_event（消息进事件队列的唯一咽喉，
 `platform.py:147` → `_event_queue.put_nowait`，aiocqhttp 适配器在
@@ -12,6 +11,13 @@
 触发（谁先满足谁赢）：
   A 静默：距最后一条满 20 秒
   B 长消息：单条去空白后 ≥25 字符（标点、emoji 都算）
+
+★ 排队分支（2026-10-14 加，取代「0/N 静默丢整轮」）：
+  **上一轮回复还在处理（pacer 的 in_flight）而且一段都还没发出去**时，
+  新消息先不进流水线、不进上下文，挂在队里等那一轮发完，由 pacer 的 _round_end 回调放行。
+  少了这一条，它会顶掉 pacer 的代号，把上一轮整轮掐掉（历史上的「实发 0/4 段」就是这么来的）。
+  已经发出至少一段之后【维持原来的打断语义】—— 那种情况用户确实想掐掉后面那些。
+  所以判定必须读 pacer 的 in_flight()：见 _busy_no_output() / release_pending()。
 
 立刻放行、不进缓冲的：
   · 非真实消息（"对方正在输入"这类空通知）
@@ -29,10 +35,10 @@
     [14:03:15] 刚下课
     <system_reminder>Current datetime: 2026-10-12 14:03 (CST), Weekday: Monday</system_reminder>
 
-  · 时间戳只写【时分秒】—— 带日期的时间戳容易被下游「按行首时间锚解析」的模块
-    误认成候选锚（合法锚是分钟精度）
+  · 时间戳只写【时分秒】—— 写成带日期的会被每天 05:00 记忆整理的行首时间锚校验
+    误认成候选锚（合法锚是分钟精度），模型照抄就 bad_anchor 整条丢
   · <system_reminder> 用【最后一条】的到达时刻（不是出手时刻），
-    跟 flush 插件的规矩一致（"时间是收到消息那一刻"）
+    跟 astrbot_plugin_pacer 的规矩一致（"时间是收到消息那一刻"）
   · 载体用【最后一条】的事件对象 —— message_id / created_at 都是新的那条，
     pacer 的 _bump 判重和 _stamp_user 按内容匹配都天然对得上
 """
@@ -49,6 +55,9 @@ from astrbot.api.event import filter
 # ───────────────────── 可调参数 ─────────────────────
 IDLE_SECONDS = 20.0      # A：距最后一条满这么久才出手
 INSTANT_CHARS = 25       # B：单条去空白后 ≥ 这么多字符就立刻出手
+HOLD_MAX_SECONDS = 300.0  # C：排队兜底上限 —— 只在【上一轮没正常收尾】时才触发
+#  ⚠️ 别把它当"最长等待"来理解：正常排队要等上一轮把 20+ 段发完（3~8s 一段，实测最长 ~3.7 分钟），
+#   所以这个值只是防"状态卡死"，要大于最长一轮的发送耗时。
 # ───────────────────────────────────────────────────
 
 ATTACHMENT_TYPES = ("image", "record", "video", "file")   # 仅作文档说明，判定用 ComponentType.value
@@ -68,7 +77,7 @@ def classify(event) -> tuple[str, list, bool]:
     """(文本, 图片组件列表, 有没有结构性组件)。
 
     ⚠️ 组件的 `type` 是 `ComponentType` 枚举，**值是大写**（"Plain"/"Image"/"Record"…），
-    不是小写字符串 —— 直接跟 "image" 比会永远为 False（flush 插件里就踩过这个坑）。
+    不是小写字符串 —— 直接跟 "image" 比会永远为 False（astrbot_plugin_pacer 里就踩了这个坑）。
     这里统一先取 .value 再转小写。
 
     可进缓冲的：Plain（文字）+ Image（图片，会作为附件挂在合并后的整条消息上）
@@ -159,15 +168,42 @@ class Main(star.Star):
             orig(event)
             return
 
+        # ★ 排队分支：上一轮还在处理（pacer 的在飞状态）而且【一段都还没发出去】⇒
+        #   这条先不进流水线、不进上下文，等上一轮回复发完由 pacer 回调放行。
+        #   否则它会顶掉代号，把上一轮整轮掐掉 —— 历史上那次「实发 0/4 段」就是这么来的。
+        if self._busy_no_output(umo):
+            b = self._bucket(umo, orig)
+            if structural:
+                b["held_events"].append((event, orig))
+                what = "结构性消息"
+            else:
+                now = float(getattr(event, "created_at", None) or time.time())
+                b["items"].append(
+                    (time.strftime("%H:%M:%S", time.localtime(now)), text, images)
+                )
+                b["event"] = event
+                b["last_ts"] = now
+                what = f"{n_chars} 字"
+            if b["timer"] is not None:
+                b["timer"].cancel()
+                b["timer"] = None
+            if b["hold_timer"] is None:
+                loop = self._loop or asyncio.get_event_loop()
+                b["hold_timer"] = loop.call_later(
+                    HOLD_MAX_SECONDS, self._on_hold_timeout, umo
+                )
+            logger.info(
+                "[burst] 上一轮还没发出第一段 → 这条排队等它发完（%s）；队里 %d 条文本 / %d 条结构性",
+                what, len(b["items"]), len(b["held_events"]),
+            )
+            return
+
         if structural:                        # 语音/文件/引用/表情：flush 批 + 原样放行
             self._flush(umo, "结构性消息")
             orig(event)
             return
 
-        b = self.bursts.get(umo)
-        if b is None:
-            b = {"items": [], "timer": None, "event": None, "last_ts": 0.0, "orig": orig}
-            self.bursts[umo] = b
+        b = self._bucket(umo, orig)
 
         now = float(getattr(event, "created_at", None) or time.time())
         gap = now - b["last_ts"] if b["last_ts"] else 0.0
@@ -196,38 +232,106 @@ class Main(star.Star):
     def _on_timeout(self, umo: str) -> None:
         self._flush(umo, f"静默 {IDLE_SECONDS:.0f}s")
 
+    # ───────────────────── 与 pacer 的「排队」协作 ─────────────────────
+
+    def _pacer(self):
+        """拿 astrbot_plugin_pacer 的实例（同一个进程，按插件名查注册表）。"""
+        try:
+            md = self.context.get_registered_star("astrbot_plugin_pacer")
+            return getattr(md, "star_cls", None) if md else None
+        except Exception:
+            return None
+
+    def _busy_no_output(self, umo: str) -> bool:
+        """上一轮是否「正在处理、且一段都还没发出去」—— 只有这种时候才排队。
+
+        已经发出至少一段时保持原来的打断语义（用户确实想掐掉后面那些）。
+        """
+        p = self._pacer()
+        if p is None:
+            return False
+        try:
+            busy, sent = p.in_flight(umo)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[burst] 读 pacer 状态失败，按不排队处理：%s", exc)
+            return False
+        return bool(busy) and int(sent) == 0
+
+    def _bucket(self, umo: str, orig) -> dict:
+        b = self.bursts.get(umo)
+        if b is None:
+            b = {
+                "items": [], "timer": None, "event": None, "last_ts": 0.0, "orig": orig,
+                "held_events": [], "hold_timer": None,
+            }
+            self.bursts[umo] = b
+        b.setdefault("held_events", [])
+        b.setdefault("hold_timer", None)
+        return b
+
+    def release_pending(self, umo: str, reason: str = "上一轮已发完") -> None:
+        """pacer 的 _round_end 回调：那一轮结束了，把排队的一批放出来。"""
+        b = self.bursts.get(umo)
+        if not b or (not b["items"] and not b.get("held_events")):
+            return
+        logger.info("[burst] 放行排队的一批（%s）", reason)
+        self._flush(umo, reason)
+
+    def _on_hold_timeout(self, umo: str) -> None:
+        """兜底：上一轮一直没收尾（崩了 / 没回复），不能把消息永远卡在队里。"""
+        b = self.bursts.get(umo)
+        if b is not None:
+            b["hold_timer"] = None
+        logger.warning(
+            "[burst] 排队超时（%.0fs）—— 先放行，可能是上一轮没正常收尾", HOLD_MAX_SECONDS
+        )
+        self._flush(umo, f"排队超时 {HOLD_MAX_SECONDS:.0f}s")
+
     # ───────────────────── 出手 ─────────────────────
 
     def _flush(self, umo: str, reason: str) -> None:
         b = self.bursts.pop(umo, None)
-        if not b or not b["items"]:
+        if not b or (not b["items"] and not b.get("held_events")):
             return
         if b["timer"] is not None:
             b["timer"].cancel()
             b["timer"] = None
+        hold = b.get("hold_timer")
+        if hold is not None:
+            hold.cancel()
+            b["hold_timer"] = None
 
-        merged = self._compose(b["items"], b["last_ts"])
-        longest = max((visible_chars(t) for _s, t, _i in b["items"]), default=0)
-        n_imgs = sum(len(i) for _s, _t, i in b["items"])
-        event = b["event"]
-        try:
-            from astrbot.api.message_components import Plain
-            chain: list = [Plain(text=merged)]
-            for _s, _t, imgs in b["items"]:     # 图片按原顺序挂在合并后的整条消息上
-                chain.extend(imgs)
-            event.message_str = merged
-            event.message_obj.message = chain
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[burst] 替换消息内容失败（继续送原来的）：%s", exc)
+        if b["items"]:
+            merged = self._compose(b["items"], b["last_ts"])
+            longest = max((visible_chars(t) for _s, t, _i in b["items"]), default=0)
+            n_imgs = sum(len(i) for _s, _t, i in b["items"])
+            event = b["event"]
+            try:
+                from astrbot.api.message_components import Plain
+                chain: list = [Plain(text=merged)]
+                for _s, _t, imgs in b["items"]:     # 图片按原顺序挂在合并后的整条消息上
+                    chain.extend(imgs)
+                event.message_str = merged
+                event.message_obj.message = chain
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[burst] 替换消息内容失败（继续送原来的）：%s", exc)
 
-        logger.info(
-            "[burst] 出手（%s）：%d 条 / 最长 %d 字 / %d 图 → 合并 %d 字",
-            reason, len(b["items"]), longest, n_imgs, len(merged),
-        )
-        try:
-            b["orig"](event)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("[burst] 送出失败（这条消息可能丢了）：%s", exc)
+            logger.info(
+                "[burst] 出手（%s）：%d 条 / 最长 %d 字 / %d 图 → 合并 %d 字",
+                reason, len(b["items"]), longest, n_imgs, len(merged),
+            )
+            try:
+                b["orig"](event)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("[burst] 送出失败（这条消息可能丢了）：%s", exc)
+
+        # 排队时攒下的【结构性】消息（语音/文件/引用…）不能合并，原样补发
+        for ev, o in b.get("held_events") or []:
+            try:
+                logger.info("[burst] 补发排队的结构性消息（%s）", reason)
+                o(ev)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("[burst] 补发排队的结构性消息失败：%s", exc)
 
     # ───────────────────── 组装 ─────────────────────
 

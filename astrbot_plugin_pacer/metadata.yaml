@@ -1,0 +1,4 @@
+name: astrbot_plugin_pacer
+desc: 接管分段发送 —— 用户插话就立刻停发剩下的分段，并把历史截成「实际发出去的部分」
+author: Lansheen3096
+version: 0.1.0
