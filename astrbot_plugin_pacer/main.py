@@ -29,7 +29,7 @@ import traceback
 from astrbot.api import logger, star
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.event.filter import EventMessageType
-from astrbot.core.message.components import At, Plain, Reply
+from astrbot.core.message.components import At, Image, Plain, Reply
 
 DEFAULT_REGEX = r"[^\n]+"   # 兜底：按行切（切分只认换行）
 ONLY_PUNCT_RE = re.compile(r"[。？！~…，、；：,.?!~\-—\s]+")   # 整段只有标点
@@ -359,6 +359,36 @@ class Main(star.Star):
         except Exception:
             return None, None
 
+    async def _image_attachment_parts(self, event) -> list[dict]:
+        """把这一轮消息里的图片，按框架的格式补进历史。
+
+        框架在构建 prompt 时会给每张图配一段 `[Image Attachment: path …]`
+        （astr_main_agent.py），但它只在【框架自己那条保存路径跑通】时才落库；
+        没有工具调用的轮次里那条路径是空跑、全靠本插件补写 —— 补写只写文本的话，
+        这个路径就从历史里消失了。
+
+        后果：下一轮要引用这张图时（例如需要 image_ref 的图片工具），模型手里
+        没有可抄的东西，只能自己编一条图片链接 ⇒ 下载必然失败。
+
+        路径走组件自己的 convert_to_file_path()，跟框架同一个方法 ⇒ 同一张图
+        命中同一份 temp 缓存，不会重复下载。
+        """
+        parts: list[dict] = []
+        message = getattr(getattr(event, "message_obj", None), "message", None) or []
+        for comp in message:
+            if not isinstance(comp, Image):
+                continue
+            try:
+                path = await comp.convert_to_file_path()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[pacer] 图片附件取路径失败（跳过）: %s", exc)
+                continue
+            if path:
+                parts.append(
+                    {"type": "text", "text": f"[Image Attachment: path {path}]"}
+                )
+        return parts
+
     def _stamp_user(self, h: list, umo: str, gen, user_text: str) -> bool:
         """给这一轮的 user 消息补上真实时间（框架自己存的那条不带时间）。
 
@@ -469,18 +499,23 @@ class Main(star.Star):
                     last_user = self._text_of(h[i])
                     break
             if self._key(last_user) != self._key(user_text):
-                h.append(
+                # ★ 图片路径必须跟文本一起进历史。框架那段 `[Image Attachment: path …]`
+                #   只在框架自己保存成功时落库，而框架那条路径在没有工具调用的轮次里
+                #   是空跑（实测全落在这里补写）⇒ 不补的话图片路径当场丢失。
+                content: list[dict] = [{"type": "text", "text": user_text + " "}]
+                attachments = await self._image_attachment_parts(event)
+                if attachments:
+                    content.extend(attachments)
+                    logger.info(
+                        "[pacer] 补写历史带上 %d 张图片的路径", len(attachments)
+                    )
+                content.append(
                     {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": user_text + " "},
-                            {
-                                "type": "text",
-                                "text": self._reminder(*self._round_time(umo, gen)),
-                            },
-                        ],
+                        "type": "text",
+                        "text": self._reminder(*self._round_time(umo, gen)),
                     }
                 )
+                h.append({"role": "user", "content": content})
             if sent_text:
                 # 同一轮被调用两次的话，别把回复也写两遍
                 dup = (
