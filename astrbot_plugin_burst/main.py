@@ -53,14 +53,19 @@ from astrbot.api import logger, star
 from astrbot.api.event import filter
 
 # ───────────────────── 可调参数 ─────────────────────
-IDLE_SECONDS = 20.0      # A：距最后一条满这么久才出手
-INSTANT_CHARS = 25       # B：单条去空白后 ≥ 这么多字符就立刻出手
+IDLE_SECONDS = 20.0  # A：距最后一条满这么久才出手
+INSTANT_CHARS = 25  # B：单条去空白后 ≥ 这么多字符就立刻出手
 HOLD_MAX_SECONDS = 300.0  # C：排队兜底上限 —— 只在【上一轮没正常收尾】时才触发
 #  ⚠️ 别把它当"最长等待"来理解：正常排队要等上一轮把 20+ 段发完（3~8s 一段，实测最长 ~3.7 分钟），
 #   所以这个值只是防"状态卡死"，要大于最长一轮的发送耗时。
 # ───────────────────────────────────────────────────
 
-ATTACHMENT_TYPES = ("image", "record", "video", "file")   # 仅作文档说明，判定用 ComponentType.value
+ATTACHMENT_TYPES = (
+    "image",
+    "record",
+    "video",
+    "file",
+)  # 仅作文档说明，判定用 ComponentType.value
 REMINDER_RE = re.compile(r"<system_reminder>.*?</system_reminder>", re.S)
 QUOTED_RE = re.compile(r"<Quoted Message>.*?</Quoted Message>", re.S)
 WS_RE = re.compile(r"\s+")
@@ -88,7 +93,7 @@ def classify(event) -> tuple[str, list, bool]:
     images: list = []
     structural = False
     try:
-        for comp in (event.message_obj.message or []):
+        for comp in event.message_obj.message or []:
             t = getattr(comp, "type", None)
             v = str(getattr(t, "value", t) or "").lower()
             if v == "plain":
@@ -99,7 +104,7 @@ def classify(event) -> tuple[str, list, bool]:
                 structural = True
                 break
     except Exception:
-        structural = True          # 判不准就别聚合，宁可直通
+        structural = True  # 判不准就别聚合，宁可直通
     return text, images, structural
 
 
@@ -144,7 +149,9 @@ class Main(star.Star):
         self._installed = True
         logger.info(
             "[burst] 已接管 %d 个 aiocqhttp 适配器（静默 %.0fs / 单条 ≥%d 字）",
-            n, self.idle_seconds, self.instant_chars,
+            n,
+            self.idle_seconds,
+            self.instant_chars,
         )
 
     def _wrap(self, inst) -> None:
@@ -173,11 +180,13 @@ class Main(star.Star):
         text, images, structural = classify(event)
         n_chars = visible_chars(text)
 
-        if not n_chars and not images and not structural:   # 空文本通知（"对方正在输入"这类）
+        if (
+            not n_chars and not images and not structural
+        ):  # 空文本通知（"对方正在输入"这类）
             orig(event)
             return
 
-        if text.lstrip().startswith("/"):    # 指令：先把攒着的出手，再原样放行
+        if text.lstrip().startswith("/"):  # 指令：先把攒着的出手，再原样放行
             self._flush(umo, "指令")
             orig(event)
             return
@@ -208,11 +217,13 @@ class Main(star.Star):
                 )
             logger.info(
                 "[burst] 上一轮还没发出第一段 → 这条排队等它发完（%s）；队里 %d 条文本 / %d 条结构性",
-                what, len(b["items"]), len(b["held_events"]),
+                what,
+                len(b["items"]),
+                len(b["held_events"]),
             )
             return
 
-        if structural:                        # 语音/文件/引用/表情：flush 批 + 原样放行
+        if structural:  # 语音/文件/引用/表情：flush 批 + 原样放行
             self._flush(umo, "结构性消息")
             orig(event)
             return
@@ -221,17 +232,21 @@ class Main(star.Star):
 
         now = float(getattr(event, "created_at", None) or time.time())
         gap = now - b["last_ts"] if b["last_ts"] else 0.0
-        b["items"].append((time.strftime("%H:%M:%S", time.localtime(now)), text, images))
+        b["items"].append(
+            (time.strftime("%H:%M:%S", time.localtime(now)), text, images)
+        )
         b["event"] = event
         b["last_ts"] = now
         if b["timer"] is not None:
             b["timer"].cancel()
             b["timer"] = None
 
-        if n_chars >= self.instant_chars:         # B：这条本身够长 → 立刻出手
+        if n_chars >= self.instant_chars:  # B：这条本身够长 → 立刻出手
             logger.info(
                 "[burst] 单条 %d 字 ≥%d → 立刻出手（本批 %d 条）",
-                n_chars, self.instant_chars, len(b["items"]),
+                n_chars,
+                self.instant_chars,
+                len(b["items"]),
             )
             self._flush(umo, f"长消息 {n_chars} 字")
             return
@@ -240,7 +255,11 @@ class Main(star.Star):
         b["timer"] = loop.call_later(self.idle_seconds, self._on_timeout, umo)
         logger.info(
             "[burst] 攒住第 %d 条（本条 %d 字 / %d 图，距上条 %.1fs）→ %.0fs 后出手",
-            len(b["items"]), n_chars, len(images), gap, self.idle_seconds,
+            len(b["items"]),
+            n_chars,
+            len(images),
+            gap,
+            self.idle_seconds,
         )
 
     def _on_timeout(self, umo: str) -> None:
@@ -275,8 +294,13 @@ class Main(star.Star):
         b = self.bursts.get(umo)
         if b is None:
             b = {
-                "items": [], "timer": None, "event": None, "last_ts": 0.0, "orig": orig,
-                "held_events": [], "hold_timer": None,
+                "items": [],
+                "timer": None,
+                "event": None,
+                "last_ts": 0.0,
+                "orig": orig,
+                "held_events": [],
+                "hold_timer": None,
             }
             self.bursts[umo] = b
         b.setdefault("held_events", [])
@@ -297,7 +321,8 @@ class Main(star.Star):
         if b is not None:
             b["hold_timer"] = None
         logger.warning(
-            "[burst] 排队超时（%.0fs）—— 先放行，可能是上一轮没正常收尾", self.hold_max_seconds
+            "[burst] 排队超时（%.0fs）—— 先放行，可能是上一轮没正常收尾",
+            self.hold_max_seconds,
         )
         self._flush(umo, f"排队超时 {self.hold_max_seconds:.0f}s")
 
@@ -322,8 +347,9 @@ class Main(star.Star):
             event = b["event"]
             try:
                 from astrbot.api.message_components import Plain
+
                 chain: list = [Plain(text=merged)]
-                for _s, _t, imgs in b["items"]:     # 图片按原顺序挂在合并后的整条消息上
+                for _s, _t, imgs in b["items"]:  # 图片按原顺序挂在合并后的整条消息上
                     chain.extend(imgs)
                 event.message_str = merged
                 event.message_obj.message = chain
@@ -332,7 +358,11 @@ class Main(star.Star):
 
             logger.info(
                 "[burst] 出手（%s）：%d 条 / 最长 %d 字 / %d 图 → 合并 %d 字",
-                reason, len(b["items"]), longest, n_imgs, len(merged),
+                reason,
+                len(b["items"]),
+                longest,
+                n_imgs,
+                len(merged),
             )
             try:
                 b["orig"](event)

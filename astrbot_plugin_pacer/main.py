@@ -15,12 +15,12 @@
 安全阀：出异常且**一段都没发出去**时，把消息链还原，交回核心按原样发送
 （宁可发得不优雅，也不要静默吞消息）。
 """
+
 from __future__ import annotations
 
 import asyncio
 import json
 import math
-import os
 import random
 import re
 import time
@@ -31,14 +31,21 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.event.filter import EventMessageType
 from astrbot.core.message.components import At, Image, Plain, Reply
 
-DEFAULT_REGEX = r"[^\n]+"   # 兜底：按行切（切分只认换行）
-ONLY_PUNCT_RE = re.compile(r"[。？！~…，、；：,.?!~\-—\s]+")   # 整段只有标点
-PUNCT_TAIL_RE = re.compile(r"[。？！~…]+\s*$")                  # 段末/括号内的句末标点
+DEFAULT_REGEX = r"[^\n]+"  # 兜底：按行切（切分只认换行）
+ONLY_PUNCT_RE = re.compile(r"[。？！~…，、；：,.?!~\-—\s]+")  # 整段只有标点
+PUNCT_TAIL_RE = re.compile(r"[。？！~…]+\s*$")  # 段末/括号内的句末标点
 # 切分符号（2026-10-14 定）：标点跟着前一句走；换行也算一条边界
 SPLIT_SYMBOLS = ("。", "？", "！", "——", "……", "♡", "?", "!", "…", "~", "～", "\n")
 # 括号表：括号块整体独立成一条，且按配对深度找闭合
-BRACKETS = (("（", "）"), ("(", ")"), ("【", "】"), ("「", "」"), ("《", "》"), ("〔", "〕"))
-MARK = "（话没说完）"     # 写进历史的标记：让 bot 知道自己刚被打断
+BRACKETS = (
+    ("（", "）"),
+    ("(", ")"),
+    ("【", "】"),
+    ("「", "」"),
+    ("《", "》"),
+    ("〔", "〕"),
+)
+MARK = "（话没说完）"  # 写进历史的标记：让 bot 知道自己刚被打断
 CFG_TTL = 30
 # 诊断开关以前靠 /AstrBot/data/trace-stop.on 文件是否存在来判断，现在移到插件配置的
 # trace_debug 项（非 Docker 部署也能用）。常量保留仅作说明。
@@ -61,10 +68,10 @@ class Main(star.Star):
         # 现在改由插件配置页控制，非 Docker 部署也能用。
         self.trace_debug = bool(self.config.get("trace_debug", False))
         self.gen: dict[str, int] = {}
-        self.seen: dict[str, str] = {}   # umo -> 最近处理过的 message_id（防重复计数）
+        self.seen: dict[str, str] = {}  # umo -> 最近处理过的 message_id（防重复计数）
         # (umo, gen) -> (收到消息的时刻, 星期)。给历史里的 user 消息打真时间用
         self.round_ts: dict[tuple[str, int], tuple[str, str]] = {}
-        self._tasks: set[asyncio.Task] = set()   # 后台发送任务（防止被 GC）
+        self._tasks: set[asyncio.Task] = set()  # 后台发送任务（防止被 GC）
         # umo -> {"gen": g, "sent": n, "active": bool}
         # 「这一轮还在处理吗 / 已经发出去几段」—— astrbot_plugin_burst 拿它决定新来的消息是【排队】还是【当插话打断】
         self.round: dict[str, dict] = {}
@@ -104,8 +111,10 @@ class Main(star.Star):
     # ---------------- 每次发送前的等待 ----------------
     def _interval(self, cfg: dict, text: str) -> float:
         if cfg["method"] == "log":
-            wc = len(text.split()) if all(ord(c) < 128 for c in text) else len(
-                [c for c in text if c.isalnum()]
+            wc = (
+                len(text.split())
+                if all(ord(c) < 128 for c in text)
+                else len([c for c in text if c.isalnum()])
             )
             base = cfg["log_base"] or 2.6
             i = math.log(wc + 1, base) if base > 1 else 1.0
@@ -177,7 +186,7 @@ class Main(star.Star):
             if not seg:
                 continue
             if ONLY_PUNCT_RE.fullmatch(seg) and final:
-                final[-1] += seg          # 纯标点并回上一条（历史行为）
+                final[-1] += seg  # 纯标点并回上一条（历史行为）
             else:
                 final.append(seg)
         return final
@@ -211,7 +220,7 @@ class Main(star.Star):
                     atoms.append(("bracket", src[i:j]))
                     i = j
                     continue
-                atoms.append(("text", src[i:]))      # 没闭合
+                atoms.append(("text", src[i:]))  # 没闭合
                 break
             j = i + 1
             while j < n and not any(src.startswith(a, j) for a, _ in BRACKETS):
@@ -230,14 +239,13 @@ class Main(star.Star):
                 i += 1
                 continue
             j = i + len(sym)
-            while j < n:        # 连着的标点（。！ ！！ ……。）一起收进前一条
+            while j < n:  # 连着的标点（。！ ！！ ……。）一起收进前一条
                 sym2 = next((x for x in SPLIT_SYMBOLS if s.startswith(x, j)), None)
                 if not sym2:
                     break
                 j += len(sym2)
             return j if any(not c.isspace() for c in s[j:]) else None
         return None
-
 
     # ---------------- 代号：每条入站消息 +1 ----------------
     @staticmethod
@@ -279,7 +287,7 @@ class Main(star.Star):
             self.seen[umo] = mid
         g = self.gen.get(umo, 0) + 1
         self.gen[umo] = g
-        self._round_begin(umo, g)          # 这一轮开始「在飞」：从进流水线到回复发完为止
+        self._round_begin(umo, g)  # 这一轮开始「在飞」：从进流水线到回复发完为止
         event.set_extra("pacer_gen", g)
         self.round_ts[(umo, g)] = (
             time.strftime("%Y-%m-%d %H:%M"),
@@ -323,7 +331,7 @@ class Main(star.Star):
         """一轮收尾（发完 / 被打断 / 没东西可发）⇒ 解除在飞，并让 burst 放行排队的那批。"""
         st = self.round.get(umo)
         if not st or st.get("gen") != gen:
-            return                 # 已经被新一轮顶掉了，别去动新的状态
+            return  # 已经被新一轮顶掉了，别去动新的状态
         st["active"] = False
         try:
             md = self.context.get_registered_star("astrbot_plugin_burst")
@@ -352,9 +360,12 @@ class Main(star.Star):
         时间是【收到用户这条消息的那一刻】（_bump 里记的），不是写历史的时刻 ——
         分段发送 + TTS 会让写入时刻晚几十秒到几分钟。
         """
-        return "<system_reminder>Current datetime: %s (CST), Weekday: %s</system_reminder>" % (
-            ts or time.strftime("%Y-%m-%d %H:%M"),
-            wd or time.strftime("%A"),
+        return (
+            "<system_reminder>Current datetime: %s (CST), Weekday: %s</system_reminder>"
+            % (
+                ts or time.strftime("%Y-%m-%d %H:%M"),
+                wd or time.strftime("%A"),
+            )
         )
 
     def _round_time(self, umo: str, gen) -> tuple[str | None, str | None]:
@@ -564,6 +575,7 @@ class Main(star.Star):
             from astrbot.core.platform.astr_message_event import (
                 AstrMessageEvent as _E,
             )
+
             if getattr(_E, "_pacer_stop_traced", False):
                 return
             _orig = _E.stop_event
@@ -597,12 +609,18 @@ class Main(star.Star):
             from astrbot.core.pipeline.process_stage.method.agent_sub_stages.internal import (
                 InternalAgentSubStage as _S,
             )
+
             if getattr(_S, "_pacer_save_traced", False):
                 return
             _orig = _S._save_to_history
 
             async def _traced(
-                self, event, req, llm_response, all_messages, runner_stats,
+                self,
+                event,
+                req,
+                llm_response,
+                all_messages,
+                runner_stats,
                 user_aborted=False,
             ):
                 try:
@@ -618,7 +636,12 @@ class Main(star.Star):
                     pass
                 try:
                     r = await _orig(
-                        self, event, req, llm_response, all_messages, runner_stats,
+                        self,
+                        event,
+                        req,
+                        llm_response,
+                        all_messages,
+                        runner_stats,
                         user_aborted,
                     )
                     logger.warning("[trace] _save_to_history 正常返回")
@@ -696,7 +719,15 @@ class Main(star.Star):
         user_text = (event.message_str or "").strip()
         task = asyncio.create_task(
             self._send_segments(
-                event, result, segs, list(headers), my_gen, umo, cfg, full_text, user_text
+                event,
+                result,
+                segs,
+                list(headers),
+                my_gen,
+                umo,
+                cfg,
+                full_text,
+                user_text,
             )
         )
         self._tasks.add(task)
@@ -722,7 +753,9 @@ class Main(star.Star):
                     await asyncio.sleep(self._interval(cfg, text))
                     if self.gen.get(umo, 0) != my_gen:
                         logger.info(
-                            "[pacer] 被打断 —— 已发 %d/%d 段，剩下的丢弃", len(sent), len(segs)
+                            "[pacer] 被打断 —— 已发 %d/%d 段，剩下的丢弃",
+                            len(sent),
+                            len(segs),
                         )
                         break
                     await event.send(result.derive([*head, *seg]))

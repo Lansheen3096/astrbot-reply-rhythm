@@ -20,6 +20,8 @@ author: Lansheen3096
 version: 0.2.0
 repo: https://github.com/Lansheen3096/astrbot_plugin_burst
 astrbot_version: ">=4.28.2"
+support_platforms:
+  - aiocqhttp
 tags:
   - 消息处理
   - 上下文
