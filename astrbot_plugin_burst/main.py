@@ -106,9 +106,23 @@ def classify(event) -> tuple[str, list, bool]:
 class Main(star.Star):
     def __init__(self, context, config=None) -> None:
         super().__init__(context, config)
+        self.config = config or {}
         self._installed = False
         self._loop = None
         self.bursts: dict[str, dict] = {}
+
+        # 运行参数：默认值与旧版硬编码一致，用户不动配置时行为不变
+        self.idle_seconds = self._cfg_num("idle_seconds", IDLE_SECONDS)
+        self.instant_chars = self._cfg_num("instant_chars", INSTANT_CHARS, int)
+        self.hold_max_seconds = self._cfg_num("hold_max_seconds", HOLD_MAX_SECONDS)
+        self.timezone_label = str(self.config.get("timezone_label") or "CST")
+
+    def _cfg_num(self, key: str, default, cast=float):
+        try:
+            return cast(self.config.get(key, default))
+        except (TypeError, ValueError):
+            logger.warning("[burst] 配置项 %s 不是有效数字，用默认值 %s", key, default)
+            return default
 
     # ───────────────────── 安装 ─────────────────────
 
@@ -130,7 +144,7 @@ class Main(star.Star):
         self._installed = True
         logger.info(
             "[burst] 已接管 %d 个 aiocqhttp 适配器（静默 %.0fs / 单条 ≥%d 字）",
-            n, IDLE_SECONDS, INSTANT_CHARS,
+            n, self.idle_seconds, self.instant_chars,
         )
 
     def _wrap(self, inst) -> None:
@@ -190,7 +204,7 @@ class Main(star.Star):
             if b["hold_timer"] is None:
                 loop = self._loop or asyncio.get_event_loop()
                 b["hold_timer"] = loop.call_later(
-                    HOLD_MAX_SECONDS, self._on_hold_timeout, umo
+                    self.hold_max_seconds, self._on_hold_timeout, umo
                 )
             logger.info(
                 "[burst] 上一轮还没发出第一段 → 这条排队等它发完（%s）；队里 %d 条文本 / %d 条结构性",
@@ -214,23 +228,23 @@ class Main(star.Star):
             b["timer"].cancel()
             b["timer"] = None
 
-        if n_chars >= INSTANT_CHARS:         # B：这条本身够长 → 立刻出手
+        if n_chars >= self.instant_chars:         # B：这条本身够长 → 立刻出手
             logger.info(
                 "[burst] 单条 %d 字 ≥%d → 立刻出手（本批 %d 条）",
-                n_chars, INSTANT_CHARS, len(b["items"]),
+                n_chars, self.instant_chars, len(b["items"]),
             )
             self._flush(umo, f"长消息 {n_chars} 字")
             return
 
         loop = self._loop or asyncio.get_event_loop()
-        b["timer"] = loop.call_later(IDLE_SECONDS, self._on_timeout, umo)
+        b["timer"] = loop.call_later(self.idle_seconds, self._on_timeout, umo)
         logger.info(
             "[burst] 攒住第 %d 条（本条 %d 字 / %d 图，距上条 %.1fs）→ %.0fs 后出手",
-            len(b["items"]), n_chars, len(images), gap, IDLE_SECONDS,
+            len(b["items"]), n_chars, len(images), gap, self.idle_seconds,
         )
 
     def _on_timeout(self, umo: str) -> None:
-        self._flush(umo, f"静默 {IDLE_SECONDS:.0f}s")
+        self._flush(umo, f"静默 {self.idle_seconds:.0f}s")
 
     # ───────────────────── 与 pacer 的「排队」协作 ─────────────────────
 
@@ -283,9 +297,9 @@ class Main(star.Star):
         if b is not None:
             b["hold_timer"] = None
         logger.warning(
-            "[burst] 排队超时（%.0fs）—— 先放行，可能是上一轮没正常收尾", HOLD_MAX_SECONDS
+            "[burst] 排队超时（%.0fs）—— 先放行，可能是上一轮没正常收尾", self.hold_max_seconds
         )
-        self._flush(umo, f"排队超时 {HOLD_MAX_SECONDS:.0f}s")
+        self._flush(umo, f"排队超时 {self.hold_max_seconds:.0f}s")
 
     # ───────────────────── 出手 ─────────────────────
 
@@ -335,8 +349,7 @@ class Main(star.Star):
 
     # ───────────────────── 组装 ─────────────────────
 
-    @staticmethod
-    def _compose(items: list, last_ts: float) -> str:
+    def _compose(self, items: list, last_ts: float) -> str:
         lines = []
         for stamp, txt, imgs in items:
             one = WS_RE.sub(" ", (txt or "").strip())
@@ -345,7 +358,11 @@ class Main(star.Star):
             lines.append(f"[{stamp}] {one}")
         t = time.localtime(last_ts or time.time())
         lines.append(
-            "<system_reminder>Current datetime: %s (CST), Weekday: %s</system_reminder>"
-            % (time.strftime("%Y-%m-%d %H:%M", t), time.strftime("%A", t))
+            "<system_reminder>Current datetime: %s (%s), Weekday: %s</system_reminder>"
+            % (
+                time.strftime("%Y-%m-%d %H:%M", t),
+                self.timezone_label,
+                time.strftime("%A", t),
+            )
         )
         return "\n".join(lines)

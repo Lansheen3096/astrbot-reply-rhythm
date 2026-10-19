@@ -1,0 +1,41 @@
+{
+  "idle_seconds": {
+    "description": "静默放行秒数",
+    "type": "float",
+    "default": 20.0,
+    "slider": {
+      "min": 3,
+      "max": 120,
+      "step": 1
+    },
+    "hint": "连续消息停下这么久之后，把攒下的一批合并送出。调小更灵敏，调大更能攒。"
+  },
+  "instant_chars": {
+    "description": "长消息立即放行字数",
+    "type": "int",
+    "default": 25,
+    "slider": {
+      "min": 5,
+      "max": 200,
+      "step": 1
+    },
+    "hint": "单条去掉空白后达到这个字数就立刻送出，不再等静默。"
+  },
+  "hold_max_seconds": {
+    "description": "排队兜底上限（秒）",
+    "type": "float",
+    "default": 300.0,
+    "slider": {
+      "min": 30,
+      "max": 900,
+      "step": 10
+    },
+    "hint": "上一轮回复一直没发完时，最多把新消息压在队里这么久。正常排队会等上一轮发完，别把这个当成最长等待时间。"
+  },
+  "timezone_label": {
+    "description": "时间标记里的时区名",
+    "type": "string",
+    "default": "CST",
+    "hint": "写进 <system_reminder> 的时区标签。服务器不在东八区就改成当地时区名。"
+  }
+}

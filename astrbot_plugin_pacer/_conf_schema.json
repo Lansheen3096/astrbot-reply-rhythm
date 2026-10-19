@@ -1,0 +1,18 @@
+{
+  "_pacer_section": {
+    "description": "=== 分段发送接管 ===",
+    "type": "text",
+    "invisible": true
+  },
+  "trace_debug": {
+    "description": "诊断追踪（排查用）",
+    "type": "bool",
+    "default": false,
+    "hint": "打开后会记录 stop_event 的调用栈和历史保存路径。正常使用保持关闭。"
+  },
+  "_pacer_note": {
+    "description": "分段间隔、切分正则等参数沿用 AstrBot 核心的「分段回复」配置，这里不重复设置。",
+    "type": "text",
+    "invisible": true
+  }
+}

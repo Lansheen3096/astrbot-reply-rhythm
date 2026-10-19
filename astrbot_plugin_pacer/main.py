@@ -40,7 +40,9 @@ SPLIT_SYMBOLS = ("。", "？", "！", "——", "……", "♡", "?", "!", "…"
 BRACKETS = (("（", "）"), ("(", ")"), ("【", "】"), ("「", "」"), ("《", "》"), ("〔", "〕"))
 MARK = "（话没说完）"     # 写进历史的标记：让 bot 知道自己刚被打断
 CFG_TTL = 30
-TRACE_FLAG = "/AstrBot/data/trace-stop.on"   # 诊断开关（存在=开）
+# 诊断开关以前靠 /AstrBot/data/trace-stop.on 文件是否存在来判断，现在移到插件配置的
+# trace_debug 项（非 Docker 部署也能用）。常量保留仅作说明。
+TRACE_FLAG = "/AstrBot/data/trace-stop.on"
 
 
 def _parse_interval(s: str) -> tuple[float, float]:
@@ -52,8 +54,12 @@ def _parse_interval(s: str) -> tuple[float, float]:
 
 
 class Main(star.Star):
-    def __init__(self, context: star.Context) -> None:
+    def __init__(self, context: star.Context, config=None) -> None:
         self.context = context
+        self.config = config or {}
+        # 诊断开关：默认关。旧版靠 /AstrBot/data/trace-stop.on 文件是否存在来判断，
+        # 现在改由插件配置页控制，非 Docker 部署也能用。
+        self.trace_debug = bool(self.config.get("trace_debug", False))
         self.gen: dict[str, int] = {}
         self.seen: dict[str, str] = {}   # umo -> 最近处理过的 message_id（防重复计数）
         # (umo, gen) -> (收到消息的时刻, 星期)。给历史里的 user 消息打真时间用
@@ -550,9 +556,9 @@ class Main(star.Star):
 
         起因：AstrBot 保存历史前有 `if not event.is_stopped()` 的判定，
         事件被 stop 过 ⇒ 整轮不进历史。查不到谁干的时先装追踪。
-        开关：`touch /AstrBot/data/trace-stop.on`（重启后生效），删掉即关。
+        开关：插件配置里打开「诊断追踪」后重启生效，关掉即停。
         """
-        if not os.path.exists(TRACE_FLAG):
+        if not self.trace_debug:
             return
         try:
             from astrbot.core.platform.astr_message_event import (
@@ -585,7 +591,7 @@ class Main(star.Star):
 
         用来分清两种可能：① 根本没被调用（保存前的判定没过）；② 调了但提前 return。
         """
-        if not os.path.exists(TRACE_FLAG):
+        if not self.trace_debug:
             return
         try:
             from astrbot.core.pipeline.process_stage.method.agent_sub_stages.internal import (
@@ -645,7 +651,7 @@ class Main(star.Star):
         if result is None or not result.chain:
             self._round_end(umo, my_gen)
             return
-        if os.path.exists(TRACE_FLAG):
+        if self.trace_debug:
             try:
                 logger.warning(
                     "[trace] 接管点 is_stopped=%s（True 就意味着这轮不会被存进历史）",

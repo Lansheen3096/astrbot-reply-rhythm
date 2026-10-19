@@ -1,4 +1,23 @@
 name: astrbot_plugin_pacer
-desc: 接管分段发送 —— 用户插话就立刻停发剩下的分段，并把历史截成「实际发出去的部分」
+display_name: 分段发送打断（correction）
+short_desc: 用户插话就停发剩余分段，并把历史截成实际发出去的部分
+desc: |
+  接管 AstrBot 的分段发送。用户中途插话时，立刻停掉剩余分段，而不是把旧内容一条条发完。
+
+  **还做了一件事**：被打断之后，把历史里那条 assistant 消息改写成「实际发出去的部分」，
+  避免 bot 记住自己说过、用户却没看到的内容。
+
+  **安全阀**：出异常且一段都还没发出去时，把消息链还原交回核心，宁可发得不优雅，也不静默吞消息。
+
+  **分段参数**沿用 AstrBot 核心的「分段回复」设置（间隔、切分正则、清理规则），不另开一套。
+
+  **和 burst 的关系**：装了 burst 时，它会在上一轮还没发出第一段时先排队，
+  由本插件的轮次结束回调放行。两个一起用效果最完整。
 author: Lansheen3096
-version: 0.1.0
+version: 0.2.0
+repo: https://github.com/Lansheen3096/astrbot-reply-rhythm
+astrbot_version: ">=4.17.0"
+tags:
+  - 消息处理
+  - 分段回复
+  - 打断
