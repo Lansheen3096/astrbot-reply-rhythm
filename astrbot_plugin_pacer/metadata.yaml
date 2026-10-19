@@ -15,7 +15,7 @@ desc: |
   由本插件的轮次结束回调放行。两个一起用效果最完整。
 author: Lansheen3096
 version: 0.2.0
-repo: https://github.com/Lansheen3096/astrbot-reply-rhythm
+repo: https://github.com/Lansheen3096/astrbot_plugin_pacer
 astrbot_version: ">=4.28.2"
 tags:
   - 消息处理

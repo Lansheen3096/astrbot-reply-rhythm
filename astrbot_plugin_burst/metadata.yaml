@@ -18,7 +18,7 @@ desc: |
   **建议**：和「分段发送打断（pacer）」一起用，效果最完整。
 author: Lansheen3096
 version: 0.2.0
-repo: https://github.com/Lansheen3096/astrbot-reply-rhythm
+repo: https://github.com/Lansheen3096/astrbot_plugin_burst
 astrbot_version: ">=4.28.2"
 tags:
   - 消息处理
