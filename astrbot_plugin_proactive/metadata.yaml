@@ -1,4 +1,27 @@
 name: astrbot_plugin_proactive
-desc: 条件式主动消息 —— 用户安静够久，bot 自己发一条过来（内容由 LLM 按当前会话人设现写）
+display_name: 条件式主动消息
+short_desc: 用户安静够久，bot 自己发一条过来（内容按当前会话人设现写）
+desc: |
+  补上框架里缺的那条链路：用户安静够久时，让 bot 自己发一条消息过来。
+
+  人设里写了「等得够久了会自己发一条过去」，但代码里没有这条路径，
+  模型只能在对话里编自己发过。这个插件把这件事落实，顺便少一个幻觉来源。
+
+  **触发条件**（全部满足才发）：
+  - 用户空闲达到设定小时数
+  - 距上一条主动消息超过冷却时间
+  - 当天条数没到上限
+  - 当前处于允许的时段
+
+  **内容**：由 LLM 按当前会话绑定的人设现写，并带最近几条对话做上下文，不允许编造。
+
+  **手动触发**：`/主动` 或 `/proactive`，立刻走同一条生成 + 发送路径，不影响计数。
+
+  **状态**保存在 `data/plugin_data/astrbot_plugin_proactive/state.json`，重装插件不会丢。
 author: Lansheen3096
-version: 0.1.0
+version: 0.2.0
+repo: https://github.com/Lansheen3096/astrbot_plugin_proactive
+astrbot_version: ">=4.28.2"
+tags:
+  - 主动消息
+  - 对话节奏
