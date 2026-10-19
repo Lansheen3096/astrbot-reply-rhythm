@@ -47,6 +47,7 @@ BRACKETS = (
 )
 MARK = "（话没说完）"  # 写进历史的标记：让 bot 知道自己刚被打断
 CFG_TTL = 30
+STALE_SECONDS = 90.0  # 在飞状态超过这么久没有发送进展就强制复位
 # 诊断开关以前靠 /AstrBot/data/trace-stop.on 文件是否存在来判断，现在移到插件配置的
 # trace_debug 项（非 Docker 部署也能用）。常量保留仅作说明。
 TRACE_FLAG = "/AstrBot/data/trace-stop.on"
@@ -316,16 +317,29 @@ class Main(star.Star):
         st = self.round.get(umo)
         if not st or not st.get("active"):
             return (False, 0)
+        # 兜底：有的路径（比如 proactive 用 llm_generate 生成、再用 context.send_message
+        # 直接发）不会经过 on_decorating_result，也就永远等不到 _round_end。
+        # 超过 STALE_SECONDS 没有任何发送进展就强制复位，否则 burst 会一直以为
+        # 「上一轮没发完」，把新消息卡到 300 秒超时。
+        if time.time() - float(st.get("ts", 0)) > STALE_SECONDS:
+            st["active"] = False
+            logger.warning(
+                "[pacer] 在飞状态超过 %.0f 秒无进展，强制复位（%s）",
+                STALE_SECONDS,
+                umo,
+            )
+            return (False, 0)
         return (True, int(st.get("sent", 0)))
 
     def _round_begin(self, umo: str, gen: int) -> None:
-        self.round[umo] = {"gen": gen, "sent": 0, "active": True}
+        self.round[umo] = {"gen": gen, "sent": 0, "active": True, "ts": time.time()}
 
     def _mark_sent(self, umo: str, gen, n: int) -> None:
         """记下发出去几段 —— 第一段一出去，burst 那边就不再排队、改成正常打断语义。"""
         st = self.round.get(umo)
         if st and st.get("gen") == gen:
             st["sent"] = int(n)
+            st["ts"] = time.time()
 
     def _round_end(self, umo: str, gen) -> None:
         """一轮收尾（发完 / 被打断 / 没东西可发）⇒ 解除在飞，并让 burst 放行排队的那批。"""

@@ -14,7 +14,7 @@ desc: |
   **和 burst 的关系**：装了 burst 时，它会在上一轮还没发出第一段时先排队，
   由本插件的轮次结束回调放行。两个一起用效果最完整。
 author: Lansheen3096
-version: 0.2.1
+version: 0.2.2
 repo: https://github.com/Lansheen3096/astrbot_plugin_pacer
 astrbot_version: ">=4.28.2"
 tags:
